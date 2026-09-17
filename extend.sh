@@ -455,6 +455,16 @@ if [ "${ENABLE_LX}" -eq 1 ]; then
     fi
 fi
 
+# 洛雪音源脚本订阅（可选）：仅当配置文件里存在订阅且 lxmusic 已启用时拉起。
+# 它不是必需组件：起不来只告警，不影响 lxmusic 与代理接管，避免因订阅问题阻断整体启用。
+if [ "${ENABLE_LX}" -eq 1 ] && [ -f "${BASE_DIR}/.env.lxsource.local" ] \
+   && grep -qE "^LX_SUBSCRIPTIONS=['\"]?[^'\"]" "${BASE_DIR}/.env.lxsource.local" 2>/dev/null; then
+    if ! ensure_source "lxsource" "http://127.0.0.1:8774" "lxsource" "fnmusic-lxsource.service"; then
+        log_warn "lxsource 订阅服务未就绪；订阅解析暂不可用，其它音源不受影响。"
+        log_warn "可稍后重试：./deploy.sh --refresh-subscriptions"
+    fi
+fi
+
 # 1.5 检查 Python 虚拟环境与依赖
 if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
     log_info "创建 .venv-proxy 虚拟环境..."

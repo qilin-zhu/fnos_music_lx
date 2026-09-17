@@ -869,9 +869,13 @@ install_lxmusic_docker() {
     fi
     log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
     reclaim_container fnmusic-lxmusic || return 1
-    # 若启用了订阅兜底，需把订阅地址/令牌一并注入 lxmusic，
+    # compose 一旦指定 --env-file 就不再读取默认的 .env。
+    # 主 .env 存有 ensure_base_image.sh 探测出的 FNMUSIC_BASE_IMAGE
+    # （国内可直接拉取的基础镜像引用），必须显式带上；
+    # 否则回退到 Dockerfile 默认的 python:3.13-slim，国内网络常拉取超时。
+    local compose_args=(--env-file "${BASE_DIR}/.env")
+    # 订阅兜底：把订阅地址/令牌一并注入 lxmusic，
     # 否则它不知道去哪里取订阅脚本（默认回落到 compose 服务名 lxsource:8774）。
-    local compose_args=()
     if [ "${ENABLE_LXSOURCE}" -eq 1 ] && [ -f "${BASE_DIR}/.env.lxsource.local" ]; then
         compose_args+=(--env-file "${BASE_DIR}/.env.lxsource.local")
     fi
@@ -938,8 +942,13 @@ install_lxsource_docker() {
     fi
     log_info "构建并启动 lxsource 订阅音源容器（:8774）..."
     reclaim_container fnmusic-lxsource || return 1
-    # compose 需显式带上订阅配置（主 .env 里没有这些键）
-    run_docker compose --env-file "${BASE_DIR}/.env.lxsource.local" \
+    # compose 指定 --env-file 后不再读取默认 .env：
+    # 需同时带上主 .env（镜像源等部署配置）与订阅配置（订阅列表/令牌）。
+    local compose_args=(--env-file "${BASE_DIR}/.env")
+    if [ -f "${BASE_DIR}/.env.lxsource.local" ]; then
+        compose_args+=(--env-file "${BASE_DIR}/.env.lxsource.local")
+    fi
+    run_docker compose "${compose_args[@]}" \
         -f "${BASE_DIR}/docker-compose.yml" up -d --build lxsource || return 1
     if wait_http "http://127.0.0.1:8774/healthz" 60 2; then
         log_info "lxsource 已就绪 http://127.0.0.1:8774/healthz"
