@@ -1013,7 +1013,11 @@ stop_unselected() {
 # Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
 # 结果写入 .env 的 FNMUSIC_BASE_IMAGE 供 compose build.args 使用；失败直接退出，不动现有部署
 if [ "${MODE}" = "docker" ]; then
-    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
+    # 启用订阅音源时一并探测 Node 基础镜像（lxsource 基于 Node）
+    ensure_node_flag=0
+    [ "${ENABLE_LXSOURCE}" -eq 1 ] && [ "${ENABLE_LX}" -eq 1 ] && ensure_node_flag=1
+    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_NODE_IMAGE="${NODE_IMAGE:-}" \
+        FNMUSIC_ENSURE_NODE="${ensure_node_flag}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
         bash "${BASE_DIR}/ensure_base_image.sh"; then
         log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源，或改用 --mode host。"
         exit 1
