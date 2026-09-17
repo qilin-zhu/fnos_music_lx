@@ -1,0 +1,13 @@
+# 热补丁覆盖文件：把已打补丁的 app.py 直接挂载进 lxmusic 容器，
+# 避免重新构建镜像（无需联网拉基础镜像 / pip 安装）。
+#
+# 用法：
+#   docker compose -f docker-compose.yml -f docker-compose.hotpatch.yml up -d lxmusic
+#
+# 适合「只想快速验证/上线、且镜像重建不便」的场景。
+# 长期部署建议改用正式构建（docker compose build lxmusic），让代码烘焙进镜像，
+# 以便与项目原有的校验/回滚流程保持一致。
+services:
+  lxmusic:
+    volumes:
+      - ./lxmusic-service/app.py:/app/app.py:ro

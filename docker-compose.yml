@@ -1,0 +1,120 @@
+# 可选音源（至少启用一个）
+# musicdl: https://github.com/CharlesPikachu/musicdl
+# musicbox: https://github.com/darknessomi/musicbox
+# lxmusic:  洛雪音乐源（LX Music 风格免登录解析：酷狗/网易/咪咕）
+#
+# 基础镜像 / pip / apt 源可由根目录 .env 覆盖（FNMUSIC_BASE_IMAGE / FNMUSIC_PIP_INDEX /
+# FNMUSIC_APT_MIRROR），其中基础镜像由 ensure_base_image.sh 自动探测维护：
+# 国内镜像优先直连（绕开 daemon 加速器），官方源兜底（不修改系统 Docker 配置，仅本应用构建生效）；
+# apt 源默认清华镜像，仅在 musicdl 构建层内临时替换，失败自动回退官方源，最终镜像与宿主机不受影响
+services:
+  musicdl:
+    build:
+      context: ./musicdl-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn}
+    container_name: fnmusic-musicdl
+    ports:
+      - "127.0.0.1:8768:8000"
+    environment:
+      - MUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient
+      - MUSICDL_SEARCH_TIMEOUT=12
+      - MUSICDL_LIMIT_PER_SOURCE=10
+      - MUSICDL_URL_TTL=1800
+      - MUSICDL_CACHE_MAX=3000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  musicbox:
+    build:
+      context: ./musicbox-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: fnmusic-musicbox
+    ports:
+      - "0.0.0.0:8770:8000"
+    volumes:
+      - ./musicbox-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # 洛雪音源脚本订阅服务（可选）：加载社区 LX JS 音源脚本作为解析兜底。
+  # 仅当 .env 设置 LX_SUBSCRIPTIONS 时才有实际作用；否则 healthz 会返回 ok:false。
+  # LX 脚本只做 musicUrl 解析，不做 search/lyric，故搜索仍走 lxmusic 官方接口。
+  lxsource:
+    build:
+      context: ./lxsource-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_NODE_IMAGE:-node:22-alpine}
+    container_name: fnmusic-lxsource
+    # lxmusic 通过 compose 网络服务名访问（http://lxsource:8774），本端口映射仅为
+    # 便于在宿主机上调试/验收。若与宿主机模式或其它的 8774 冲突，
+    # 设 LXSOURCE_BIND_PORT=18774 即可只改宿主机侧端口（容器内仍是 8774）。
+    ports:
+      - "127.0.0.1:${LXSOURCE_BIND_PORT:-8774}:8774"
+    environment:
+      - LX_SUBSCRIPTIONS=${LX_SUBSCRIPTIONS:-}
+      - LXSOURCE_PORT=8774
+      - LXSOURCE_HOST=0.0.0.0
+      - LXSOURCE_REFRESH_S=${LXSOURCE_REFRESH_S:-3600}
+      - LX_TOKEN=${LX_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8774/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  lxmusic:
+    build:
+      context: ./lxmusic-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: fnmusic-lxmusic
+    ports:
+      - "127.0.0.1:8772:8000"
+    environment:
+      - LX_SOURCES=${LX_SOURCES:-kg,wy,mg,kw}
+      - LX_SEARCH_TIMEOUT=${LX_SEARCH_TIMEOUT:-12}
+      - LX_LIMIT_PER_SOURCE=${LX_LIMIT_PER_SOURCE:-20}
+      - LX_THIRD_PARTY=${LX_THIRD_PARTY:-1}
+      # 订阅兜底：指向 lxsource 容器（同 compose 网络内用服务名）
+      # docker 模式默认走同网络服务名 lxsource；
+      # 若 lxsource 跑在宿主机（--mode host），改为 http://host.docker.internal:8774
+      - LX_SUBSCRIPTION_URL=${LX_SUBSCRIPTION_URL:-http://lxsource:8774}
+      - LX_SUBSCRIPTION_TOKEN=${LX_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

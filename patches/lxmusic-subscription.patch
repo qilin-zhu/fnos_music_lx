@@ -1,0 +1,204 @@
+--- a/lxmusic-service/app.py
++++ b/lxmusic-service/app.py
+@@ -51,6 +51,12 @@
+     "probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "5.0")),
+     # 搜索期 VIP/第三方直链曲目的探活结果有效期（秒）：过期后 track/url 重新解析
+     "probe_fresh_s": int(os.environ.get("LX_PROBE_FRESH_S", "900")),
++    # ikun 聚合解析 API（洛雪音源脚本 ikun-music-source.js 的后端，快速直连路径）
++    "ikun_url": (os.environ.get("LX_IKUN_URL") or "https://c.wwwweb.top").strip().rstrip("/"),
++    "ikun_key": (os.environ.get("LX_IKUN_KEY") or "").strip(),
++    # 订阅式音源服务（洛雪 JS 脚本沙箱，lxsource-service）地址；为空则关闭该兜底链路
++    "subscription_url": (os.environ.get("LX_SUBSCRIPTION_URL") or "").strip().rstrip("/"),
++    "subscription_token": (os.environ.get("LX_SUBSCRIPTION_TOKEN") or "").strip(),
+ }
+ 
+ # 支持的音源别名归一化
+@@ -763,6 +769,15 @@
+ _CHAIN_HEALTH: dict[str, dict] = {}
+ 
+ 
++def _chain_configured(link: dict) -> bool:
++    """链路是否已在配置中启用（例如填了 API Key / 订阅地址）。
++
++    未配置的链路不得冒充「可播放」，否则能力上报会对用户撒谎。
++    """
++    check = link.get("configured")
++    return bool(check()) if callable(check) else True
++
++
+ def _chain_available(name: str) -> bool:
+     h = _CHAIN_HEALTH.get(name)
+     return not (h and (h.get("open_until", 0) > time.time() or h.get("half_open")))
+@@ -818,6 +833,108 @@
+     return {"url": url, "headers": dict(KW_HEADERS)}
+ 
+ 
++_TIER_TO_IKUN_QUALITY = {"lossless": "flac", "high": "320k", "standard": "128k"}
++
++
++async def _chain_ikun(client: httpx.AsyncClient, ctx: dict) -> "dict | None":
++    """ikun 音源：POST /music/url，覆盖 kg/wy/tx/kw。只解析，探活由调度器统一做。"""
++    key = CONF["ikun_key"]
++    if not key:
++        return None
++    platform = str(ctx.get("platform") or "")
++    identifier = str(ctx.get("identifier") or "")
++    if not platform or not identifier:
++        return None
++    quality = _TIER_TO_IKUN_QUALITY.get(str(ctx.get("tier") or "standard"), "320k")
++    try:
++        r = await client.post(
++            f"{CONF['ikun_url']}/music/url",
++            json={"source": platform, "musicId": identifier, "quality": quality},
++            headers={
++                "Content-Type": "application/json",
++                "X-Api-Key": key,
++                "User-Agent": UA_PC,
++            },
++            timeout=CONF["resolver_timeout"],
++        )
++    except httpx.HTTPError as exc:
++        raise ChainTransportError(str(exc)) from exc
++    if r.status_code in (401, 403):
++        raise ChainTransportError("ikun auth failed (check LX_IKUN_KEY)")
++    if r.status_code == 429 or r.status_code >= 500:
++        raise ChainTransportError(f"resolver HTTP {r.status_code}")
++    if r.status_code >= 400:
++        return None
++    data = _lenient_json(r, "ikun")
++    if not isinstance(data, dict):
++        raise ChainTransportError("invalid resolver response")
++    try:
++        code = int(data.get("code"))
++    except (TypeError, ValueError):
++        raise ChainTransportError("missing resolver code")
++    if code == 200:
++        url = str(data.get("url") or "")
++        if not url.startswith(("http://", "https://")):
++            return None
++        return {"url": url, "resolution_quality": str(data.get("quality") or quality)}
++    if code in (403, 429):
++        raise ChainTransportError(f"ikun code {code}: {data.get('message')}")
++    # 500/其他=该曲无链接或不支持该源，属正常未命中，不熔断
++    return None
++
++
++_TIER_TO_SCRIPT_QUALITY = {"lossless": "flac", "high": "320k", "standard": "128k"}
++
++
++async def _chain_subscription(client: httpx.AsyncClient, ctx: dict) -> "dict | None":
++    """订阅音源：把解析委托给 lxsource-service 中的洛雪 JS 脚本沙箱。
++
++    作为「可插拔兜底」排在直接 API 链路之后：脚本可随时通过订阅链接更新，
++    无需改动本仓库代码。脚本自身不做探活，返回的 url 由调度器统一验证。
++    """
++    base = CONF["subscription_url"]
++    if not base:
++        return None
++    platform = str(ctx.get("platform") or "")
++    identifier = str(ctx.get("identifier") or "")
++    if not platform or not identifier:
++        return None
++    headers = {"Accept": "application/json"}
++    if CONF["subscription_token"]:
++        headers["X-Api-Token"] = CONF["subscription_token"]
++    params = {
++        "source": platform,
++        "id": identifier,
++        "quality": _TIER_TO_SCRIPT_QUALITY.get(str(ctx.get("tier") or "standard"), "320k"),
++    }
++    if ctx.get("title"):
++        params["title"] = str(ctx["title"])
++    if ctx.get("artist"):
++        params["artist"] = str(ctx["artist"])
++    try:
++        r = await client.get(f"{base}/api/v1/track/url", params=params,
++                             headers=headers, timeout=CONF["resolver_timeout"] + 6.0)
++    except httpx.HTTPError as exc:
++        raise ChainTransportError(str(exc)) from exc
++    if r.status_code in (401, 403):
++        raise ChainTransportError("subscription auth failed (check LX_SUBSCRIPTION_TOKEN)")
++    if r.status_code == 429 or r.status_code >= 500:
++        raise ChainTransportError(f"subscription HTTP {r.status_code}")
++    if r.status_code >= 400:
++        return None  # 404/其它 = 所有订阅均未解析出该曲，属正常未命中
++    data = _lenient_json(r, "subscription")
++    if not isinstance(data, dict):
++        raise ChainTransportError("invalid subscription response")
++    if not data.get("ok"):
++        return None
++    payload = data.get("data") or {}
++    url = str(payload.get("url") or "")
++    if not url.startswith(("http://", "https://")):
++        return None
++    return {"url": url, "resolution_quality": str(payload.get("quality") or params["quality"]),
++            "subscription": str(payload.get("subscription") or "")}
++
++
+ async def _chain_suyin_migu(client: httpx.AsyncClient, ctx: dict) -> "dict | None":
+     """溯音咪咕：关键词搜索式解析，返回 music_url(320k)。需标题模糊匹配防错歌。"""
+     keyword = " ".join(x for x in (ctx.get("title"), ctx.get("artist")) if x).strip()
+@@ -861,6 +978,13 @@
+ 
+ THIRD_PARTY_CHAIN: list[dict] = [
+     {
++        "name": "ikun",
++        "platforms": {"kg", "wy", "tx", "kw"},
++        "needs_keyword": False,
++        "fn": _chain_ikun,
++        "configured": lambda: bool(CONF["ikun_key"]),
++    },
++    {
+         "name": "changqing_kw",
+         "platforms": {"kw"},
+         "needs_keyword": False,
+@@ -872,6 +996,13 @@
+         "needs_keyword": True,
+         "fn": _chain_suyin_migu,
+     },
++    {
++        "name": "subscription",
++        "platforms": {"kg", "wy", "mg", "tx", "kw"},
++        "needs_keyword": False,
++        "fn": _chain_subscription,
++        "configured": lambda: bool(CONF["subscription_url"]),
++    },
+ ]
+ 
+ 
+@@ -891,11 +1022,13 @@
+             continue
+         if link.get("needs_keyword") and not (title or artist):
+             continue
++        if not _chain_configured(link):
++            continue
+         if not _chain_acquire(link["name"]):
+             _record_failure(ChainTransportError("resolver circuit open"))
+             continue
+         recovering = bool(_CHAIN_HEALTH.get(link["name"], {}).get("half_open"))
+-        ctx = {"identifier": identifier, "tier": tier, "title": title, "artist": artist}
++        ctx = {"platform": platform, "identifier": identifier, "tier": tier, "title": title, "artist": artist}
+         try:
+             result = await asyncio.wait_for(
+                 link["fn"](client, ctx), timeout=CONF["resolver_timeout"] + CONF["probe_timeout"]
+@@ -925,6 +1058,8 @@
+     now = time.time()
+     snapshot = {}
+     for link in THIRD_PARTY_CHAIN:
++        if not _chain_configured(link):
++            continue
+         name = link["name"]
+         h = _CHAIN_HEALTH.get(name, {})
+         state = ("disabled" if not CONF["third_party"] else
+@@ -941,7 +1076,10 @@
+     result = {}
+     for src in _SEARCHERS:
+         official = src in ("kg", "wy", "mg")
+-        links = [link for link in THIRD_PARTY_CHAIN if src in link["platforms"]]
++        # 只把「已配置」的链路算作该平台的可用解析途径；
++        # 未填 Key / 未填订阅地址的链路不得冒充可播放。
++        links = [link for link in THIRD_PARTY_CHAIN
++                 if src in link["platforms"] and _chain_configured(link)]
+         available = CONF["third_party"] and any(_chain_available(link["name"]) for link in links)
+         reason = ("" if official or available else "third_party_disabled" if not CONF["third_party"]
+                   else "no_resolver_registered" if not links else "resolver_circuit_open")

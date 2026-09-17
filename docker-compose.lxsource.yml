@@ -1,0 +1,39 @@
+# 洛雪音源脚本订阅服务（可选组件）
+#
+# 用途：加载社区洛雪 (LX Music) JS 音源脚本，提供可订阅的第三方解析兜底。
+# 用法：在根目录 .env 中设置 LX_SUBSCRIPTIONS，然后
+#   docker compose -f docker-compose.lxsource.yml up -d --build
+#
+# 注意：LX 脚本只实现 musicUrl（解析直链），不实现 search/lyric，
+# 因此搜索与歌词仍由 lxmusic-service 的官方接口负责。
+services:
+  lxsource:
+    build:
+      context: ./lxsource-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_NODE_IMAGE:-node:22-alpine}
+    container_name: fnmusic-lxsource
+    # 仅为宿主机调试/验收；lxmusic 走 compose 网络服务名，不依赖此映射。
+    ports:
+      - "127.0.0.1:${LXSOURCE_BIND_PORT:-8774}:8774"
+    environment:
+      - LX_SUBSCRIPTIONS=${LX_SUBSCRIPTIONS:-}
+      - LXSOURCE_PORT=8774
+      - LXSOURCE_HOST=0.0.0.0
+      - LXSOURCE_REFRESH_S=${LXSOURCE_REFRESH_S:-3600}
+      - LX_TOKEN=${LX_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8774/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
