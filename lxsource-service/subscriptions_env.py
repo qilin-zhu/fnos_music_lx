@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 KEY = "LX_SUBSCRIPTIONS"
 DEFAULT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.lxsource.local")
@@ -29,6 +30,9 @@ DEFAULT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 # shell 单引号转义：' -> '\''
 _ESCAPED_QUOTE = "'\\''"
 _SECRET_RE = re.compile(r"((?:key|token|apikey|api_key|password|secret)=)[^&,\s]+", re.I)
+# 兜底：自动命名会把非 [A-Za-z0-9_.-] 换成 "_"，于是 ?key=SECRET 变成 key_SECRET。
+# 这种形态没有被上面的规则覆盖，单独屏蔽，避免历史配置里的密钥被打印出来。
+_NAMED_SECRET_RE = re.compile(r"(?i)((?:key|token|apikey|api_key|password|secret)_)[A-Za-z0-9_.-]+")
 
 
 def unquote(raw: str) -> str:
@@ -48,7 +52,9 @@ def quote(value: str) -> str:
 
 def redact(value: str) -> str:
     """隐藏密钥参数，便于安全打印。"""
-    return _SECRET_RE.sub(r"\1***", str(value or ""))
+    text = _SECRET_RE.sub(r"\1***", str(value or ""))
+    # 兜底处理自动命名遗留的 key_SECRET 形态（旧版本 bug 写入的名字）
+    return _NAMED_SECRET_RE.sub(r"\1***", text)
 
 
 def parse_entries(raw: str) -> "list[tuple[str, str]]":
@@ -72,6 +78,8 @@ def parse_entries(raw: str) -> "list[tuple[str, str]]":
             continue
         if not name:
             name = _auto_name(url, idx)
+        else:
+            name = _sanitize_name(name, url, idx)
         unique, n = name, 2
         while unique in used:
             unique = f"{name}_{n}"
@@ -81,16 +89,57 @@ def parse_entries(raw: str) -> "list[tuple[str, str]]":
     return out
 
 
+def _url_secrets(url: str) -> "list[str]":
+    """提取 URL query 中形如 key=/token= 的密钥值（用于检测名字是否误含密钥）。"""
+    try:
+        query = urlsplit(url).query
+    except ValueError:
+        return []
+    out = []
+    for pair in query.split("&"):
+        k, _, v = pair.partition("=")
+        if v and re.fullmatch(r"(?i)(key|token|apikey|api_key|password|secret)", k):
+            out.append(v)
+    return out
+
+
+def _sanitize_name(name: str, url: str, idx: int) -> str:
+    """修复被旧版本 bug 污染的名字（名字里嵌入了 URL 密钥）。
+
+    旧版 _auto_name 会保留 query string，于是 ?key=SECRET 被写进名字并落盘。
+    该名字一旦写进配置，后续读取时会被当成「显式命名」而原样保留，
+    因此在读取路径上也要能自愈：检测到密钥出现在名字里就重新推导。
+    仅当密钥确实来自该条 URL 时才修正，不会影响用户自定义的正常名字。
+    """
+    for secret in _url_secrets(url):
+        if secret and secret in name:
+            return _auto_name(url, idx)
+    return name
+
+
 def _auto_name(url: str, idx: int) -> str:
+    """由 URL 推导订阅名。
+
+    必须与 lxsource-service 的 parseSubscriptions（subscription.js）保持一致：
+    只取 hostname + pathname，**不含 query / fragment**。
+    订阅地址普遍把密钥放在 query（如 ?key=xxx），若把它带进名字，
+    密钥会被写进配置文件的『名字』字段、日志、以及脱敏输出（redact 只处理
+    URL 里的 key=，不会处理名字），造成密钥泄露。
+    """
     if url.startswith("file://"):
         base = os.path.basename(url[len("file://"):])
         return os.path.splitext(base)[0] or f"source{idx + 1}"
-    m = re.match(r"^[a-z]+://([^/]+)(/.*)?$", url, re.I)
-    if not m:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
         return f"source{idx + 1}"
-    host, path = m.group(1), (m.group(2) or "")
-    stem = os.path.splitext(path)[0]
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", f"{host}{stem}") or f"source{idx + 1}"
+    if not parts.hostname:
+        return f"source{idx + 1}"
+    # pathname 天然不含 query/fragment；与 JS 的 u.pathname 语义一致
+    stem = os.path.splitext(parts.path or "")[0]
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{parts.hostname}{stem}")
+    return name.strip("_") or f"source{idx + 1}"
+
 
 
 def format_entries(entries: "list[tuple[str, str]]") -> str:

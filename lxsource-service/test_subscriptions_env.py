@@ -96,6 +96,58 @@ class TestQuoting:
     def test_redact_keeps_plain(self):
         assert S.redact("https://x/plain.js") == "https://x/plain.js"
 
+    def test_redact_hides_secret_in_auto_name(self):
+        # 旧版本 bug 会把 ?key=SECRET 变成名字里的 key_SECRET；打印时必须一并屏蔽
+        out = S.redact("c.wwwweb.top_s_lxmusic_key_SECRET123|https://x/a?key=SECRET123")
+        assert "SECRET123" not in out
+
+    def test_redact_keeps_normal_name(self):
+        out = S.redact("ikun|https://x/a.js")
+        assert out == "ikun|https://x/a.js"
+
+
+class TestAutoNameNoSecret:
+    """自动命名绝不能把 query（常带 key/token）带进订阅名。
+
+    名字会写进配置文件、日志、沙箱文件名，且 redact 只处理 URL 形式的
+    key=，名字里的密钥不会被打码——一旦带进去就是明文泄露。
+    """
+
+    URL = "https://c.wwwweb.top/script/lxmusic?key=SAMPLEKEY-0000-aaaaBBBBccccDDDD"
+
+    def test_bare_url_name_has_no_query(self):
+        got = S.parse_entries(self.URL)
+        assert got[0][0] == "c.wwwweb.top_script_lxmusic"
+
+    def test_bare_url_name_has_no_secret(self):
+        got = S.parse_entries(self.URL)
+        assert "key" not in got[0][0]
+        assert "SAMPLEKEY-0000" not in got[0][0]
+        # URL 本身必须原样保留（密钥仍要能用于请求）
+        assert got[0][1] == self.URL
+
+    def test_name_matches_js_implementation(self):
+        # 与 subscription.js 的 parseSubscriptions 保持一致
+        assert S._auto_name("https://a.com/path/src.js", 0) == "a.com_path_src"
+        assert S._auto_name("http://host:8080/x/y.js?k=1", 0) == "host_x_y"
+        assert S._auto_name("file:///opt/lx-src/local.js", 0) == "local"
+
+    def test_polluted_name_self_heals(self):
+        polluted = "c.wwwweb.top_script_lxmusic_key_SAMPLEKEY-0000-aaaaBBBBccccDDDD"
+        got = S.parse_entries(f"{polluted}|{self.URL}")
+        assert got[0][0] == "c.wwwweb.top_script_lxmusic"
+        assert "SAMPLEKEY-0000" not in got[0][0]
+
+    def test_custom_name_untouched(self):
+        # 用户自定义名字（与密钥无关）不得被改写
+        assert S.parse_entries(f"my-ikun|{self.URL}")[0][0] == "my-ikun"
+
+    def test_write_then_read_never_stores_secret_in_name(self, envfile):
+        S.write_subscriptions(envfile, S.parse_entries(self.URL))
+        entries = S.read_subscriptions(envfile)
+        assert entries[0][0] == "c.wwwweb.top_script_lxmusic"
+        assert "SAMPLEKEY-0000" not in entries[0][0]
+
 
 class TestReadWrite:
     def test_read_existing(self, envfile):

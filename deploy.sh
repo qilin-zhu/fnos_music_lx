@@ -102,8 +102,11 @@ resolve_lxsource_health() {
 }
 
 # 输出订阅摘要，但绝不打印密钥（key=/token= 等参数一律脱敏）
+# 同时处理自动命名遗留的 key_SECRET 形态（旧版本 bug 会把 ?key= 写进订阅名）
 redact() {
-    printf '%s' "${1:-}" | sed -E 's#((key|token|apikey|api_key|password|secret)=)[^&, ]+#\1***#Ig'
+    printf '%s' "${1:-}" \
+        | sed -E 's#((key|token|apikey|api_key|password|secret)=)[^&, ]+#\1***#Ig' \
+        | sed -E 's#((key|token|apikey|api_key|password|secret)_)[A-Za-z0-9_.-]+#\1***#Ig'
 }
 
 subscription_summary() {
@@ -197,6 +200,48 @@ stop_docker_lxsource() {
     fi
 }
 
+# 释放宿主机映射端口：只停「本方案自己的」lxsource（容器 / 宿主机实例），
+# 不自动改用替代端口——端口会写进 .env.lxsource.local 并出现在 lxmusic 的订阅地址里，
+# 静默改成 18774 会让用户按 8774 排查时找不到服务。
+# 仍被外部进程占用时直接报错，由用户决定是否改 LXSOURCE_BIND_PORT。
+free_bind_port() {
+    local port="$1"
+
+    port_owner_hint "$port" >/dev/null || return 0   # 端口空闲
+
+    # 1) 宿主机模式实例（含 pid 文件丢失但进程仍监听的情况）
+    if [ -f /tmp/lxsource-service.pid ] || pgrep -f "lxsource-service/server.js" >/dev/null 2>&1; then
+        c_ylw "  宿主机模式的 lxsource 占用端口 ${port}，先停止以释放"
+        "$ROOT/lxsource-service/run-local.sh" --stop 2>&1 | sed 's/^/  /' || true
+    fi
+
+    # 2) docker 容器：本方案容器在启动/重启时正是占着该端口的常见原因
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'fnmusic-lxsource'; then
+            c_ylw "  fnmusic-lxsource 容器占用端口 ${port}，先停止以释放"
+            docker stop fnmusic-lxsource >/dev/null 2>&1 \
+                && c_grn "  已停止 fnmusic-lxsource 容器" || true
+        fi
+    fi
+
+    # 3) 等端口真正释放（容器停止 + 端口回收需要几秒）
+    local i owner
+    for i in $(seq 1 15); do
+        if ! port_owner_hint "$port" >/dev/null; then
+            c_grn "  端口 ${port} 已释放"
+            return 0
+        fi
+        sleep 1
+    done
+
+    # 4) 仍被占用：报错而不是换端口
+    owner="$(port_owner_hint "$port" || true)"
+    c_red "  端口 ${port} 仍被占用（${owner}），且不属于本方案的 lxsource"
+    c_red "  请先停止占用进程后重试：sudo ss -tlnp | grep :${port}"
+    c_red "  或显式改端口：export LXSOURCE_BIND_PORT=<其它端口> 后再执行"
+    return 1
+}
+
 start_docker() {
     step "启动 lxsource + lxmusic（docker compose）"
     if ! command -v docker >/dev/null 2>&1; then
@@ -209,32 +254,12 @@ start_docker() {
     fi
 
     # docker 模式与宿主机模式抢同一个 8774：先停掉宿主机实例，避免端口冲突。
-    if [ -f /tmp/lxsource-service.pid ] || ss -tln 2>/dev/null | grep -q ":${LXSOURCE_PORT:-8774} "; then
-        if [ -f /tmp/lxsource-service.pid ]; then
-            c_ylw "  检测到宿主机模式的 lxsource 正在运行，先停止以释放端口"
-            "$ROOT/lxsource-service/run-local.sh" --stop 2>&1 | sed 's/^/  /'
-        fi
-    fi
+    # （free_bind_port 会连同本方案的容器一起处理，此处不再单独判断）
 
-    # 宿主机侧映射端口冲突时自动让路（容器间仍走服务名 lxsource:8774，不受影响）
+    # 宿主侧映射端口若被本方案的 lxsource 占用则先停掉；
+    # 被无关进程占用时直接失败，不自动改用 18774 之类的替代端口。
     local bind_port="${LXSOURCE_BIND_PORT:-8774}"
-    local owner
-    if owner="$(port_owner_hint "$bind_port")"; then
-        local alt=""
-        for cand in 18774 28774 38774 48774; do
-            if ! port_owner_hint "$cand" >/dev/null; then alt="$cand"; break; fi
-        done
-        if [ -n "$alt" ]; then
-            c_ylw "  宿主机端口 ${bind_port} 已被占用（${owner}）"
-            c_ylw "  自动改用 ${alt}（容器内仍是 8774，lxmusic 走服务名不受影响）"
-            export LXSOURCE_BIND_PORT="$alt"
-            bind_port="$alt"
-        else
-            c_red "  宿主机端口 ${bind_port} 被占用（${owner}），且未找到可用替代端口"
-            c_red "  请释放该端口，或设 LXSOURCE_BIND_PORT 指定其它端口"
-            return 1
-        fi
-    fi
+    free_bind_port "$bind_port" || return 1
     c_ylw "  宿主机验收端口：${bind_port}（容器内 8774）"
 
     local compose_files=(-f "$ROOT/docker-compose.yml")
@@ -321,11 +346,9 @@ redeploy_lxsource() {
     local args=()
     compose_env_args
     args=("${COMPOSE_ARGS[@]}")
-    # 宿主机模式实例若占着端口，先停掉，避免绑定冲突
-    if [ -f /tmp/lxsource-service.pid ]; then
-        c_ylw "  检测到宿主机模式实例，先停止以释放端口"
-        "$ROOT/lxsource-service/run-local.sh" --stop 2>&1 | sed 's/^/  /'
-    fi
+    # 宿主侧映射端口若被本方案实例（宿主机实例/旧容器）占用，先停掉释放；
+    # --force-recreate 无法抢占已被占用的宿主端口，必须先腾出来。
+    free_bind_port "${LXSOURCE_BIND_PORT:-8774}" || return 1
     ( cd "$ROOT" && docker compose "${args[@]}" -f docker-compose.yml up -d --force-recreate lxsource ) || {
         c_red "  lxsource 重建失败"; return 1; }
     c_grn "  已重建 fnmusic-lxsource"
