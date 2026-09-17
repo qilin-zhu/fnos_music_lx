@@ -517,7 +517,28 @@ else
     c_red "未知模式：$MODE（可选 host / docker）"; exit 2
 fi
 
-sleep 3
+# 等待服务就绪：lxsource 需要先把订阅脚本加载完才监听端口，
+# 慢速订阅源可能耗时十几秒，固定 sleep 会误判为失败。
+wait_ready() {
+    local url="$1" label="$2" tries="${3:-30}" delay="${4:-2}"
+    local i
+    printf '  等待 %s 就绪' "$label"
+    for i in $(seq 1 "$tries"); do
+        if curl -sf --max-time 4 "$url" >/dev/null 2>&1; then
+            printf ' ✅\n'
+            return 0
+        fi
+        printf '.'
+        sleep "$delay"
+    done
+    printf ' ⚠️ 超时\n'
+    return 1
+}
+
+# 先等到至少端口开放再验收，避免把启动中的服务判为故障
+wait_ready "${LXSOURCE_HEALTH}" "lxsource" 30 2 || true
+wait_ready "${LXMUSIC_HEALTH}" "lxmusic" 20 2 || true
+
 if verify; then
     c_grn "\n部署完成。"
 else

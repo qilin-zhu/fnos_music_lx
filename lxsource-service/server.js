@@ -210,13 +210,23 @@ async function main() {
   } else {
     log(`[lxsource] loading ${manager.subscriptions.length} subscription(s)...`);
   }
+
+  // 先监听端口，再在后台加载订阅。
+  // 订阅脚本可能来自很慢的源站；若等加载完才 listen，健康检查会长时间失败，
+  // 容器也会一直处于 unhealthy（部署脚本/用户都会误判为启动失败）。
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(PORT, HOST, () => {
+      log(`[lxsource] listening on http://${HOST}:${PORT} (refresh=${REFRESH_S}s, token=${TOKEN ? 'on' : 'off'})`);
+      resolve();
+    });
+  });
+
+  // 后台加载；未就绪期间 /healthz 返回 503（enabled=true, degraded=true），
+  // 这是准确的「已启动但尚无可用订阅」状态，而不是端口不可达。
   const ready = await manager.loadAll();
   log(`[lxsource] ${ready}/${manager.subscriptions.length} subscription(s) ready`);
   manager.startAutoRefresh(REFRESH_S * 1000);
-
-  server.listen(PORT, HOST, () => {
-    log(`[lxsource] listening on http://${HOST}:${PORT} (refresh=${REFRESH_S}s, token=${TOKEN ? 'on' : 'off'})`);
-  });
 }
 
 function shutdown(signal) {

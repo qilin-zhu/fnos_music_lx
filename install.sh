@@ -47,6 +47,11 @@ LXSOURCE_REFRESH_S="${LXSOURCE_REFRESH_S:-3600}"
 LXSOURCE_BIND_PORT="${LXSOURCE_BIND_PORT:-8774}"
 ENABLE_LXSOURCE=0
 NO_SUBSCRIPTION=0
+# 洛雪歌单（把平台排行榜注入侧边栏）；空=交互时询问，非交互默认关闭
+ENABLE_CHARTS=""
+NO_CHARTS=0
+# 已存在的容器默认跳过重建（避免每次安装都重新编译镜像）
+FORCE_REBUILD=0
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
@@ -74,7 +79,10 @@ usage() {
                          本地脚本: --subscription 'local|file:///path/to/src.js'
                          也可用环境变量 LX_SUBSCRIPTIONS 传入（避免进入 shell 历史）
   --no-subscription      明确不启用订阅音源
-  --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
+  --charts               开启洛雪歌单（把各平台排行榜注入侧边栏）
+  --no-charts            明确关闭洛雪歌单
+  --force-rebuild        强制重建已存在的容器镜像（默认已存在则跳过构建）
+  --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐、不开启歌单
   --enable-recommend     开启每日推荐（需同时给 base-url 与 api-key）
   --disable-recommend    明确关闭每日推荐
   --llm-base-url URL     OpenAI 兼容 Base URL，例如 https://api.openai.com/v1
@@ -178,6 +186,9 @@ while [ $# -gt 0 ]; do
             LX_SUBSCRIPTIONS="${2}"; shift 2 ;;
         --subscription=*) LX_SUBSCRIPTIONS="${1#*=}"; shift ;;
         --no-subscription) LX_SUBSCRIPTIONS=""; NO_SUBSCRIPTION=1; shift ;;
+        --charts) ENABLE_CHARTS="yes"; shift ;;
+        --no-charts) ENABLE_CHARTS="no"; NO_CHARTS=1; shift ;;
+        --force-rebuild) FORCE_REBUILD=1; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
         --disable-recommend) ENABLE_RECOMMEND="no"; shift ;;
@@ -497,6 +508,18 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             LX_SUBSCRIPTIONS="${sub_input}"
         fi
     fi
+    # 洛雪歌单（可选）：把各平台排行榜注入侧边栏，默认关闭
+    if [ "${NO_CHARTS}" -eq 0 ] && [ -z "${ENABLE_CHARTS}" ]; then
+        echo
+        echo "洛雪歌单（可选）:"
+        echo "  在飞牛音乐侧边栏注入各平台排行榜（网易云/酷狗/酷我等热歌榜）。"
+        echo "  数据来自平台公开榜单接口，与订阅音源无关；点击播放时才走音源解析。"
+        charts_choice="$(prompt "是否开启洛雪歌单? [y/N]" "N")"
+        case "${charts_choice}" in
+            y|Y|yes|YES) ENABLE_CHARTS="yes" ;;
+            *) ENABLE_CHARTS="no" ;;
+        esac
+    fi
     if [ -z "${ENABLE_RECOMMEND}" ]; then
         echo "大模型每日推荐歌单（可选选填）:"
         echo "  支持接入兼容 OpenAI 协议的大模型（如 DeepSeek/GPT/Qwen 等），"
@@ -534,6 +557,8 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
 else
     MODE="${MODE:-docker}"
     SOURCES_RAW="${SOURCES_RAW:-musicdl}"
+    # 非交互且未显式指定时，ENABLE_CHARTS 保持为空：
+    # 写入阶段会跳过该键，从而保留 .env 里用户已有设置，不会被静默关闭。
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
             log_err "--enable-recommend 需要同时提供 --llm-base-url 与 --llm-api-key"
@@ -607,6 +632,12 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
+    # 洛雪歌单：仅在用户本次明确表态时写入（空=保留 .env 里已有设置）
+    if [ "${ENABLE_CHARTS}" = "yes" ]; then
+        echo "FNMUSIC_CHARTS_ENABLED='true'"
+    elif [ "${ENABLE_CHARTS}" = "no" ]; then
+        echo "FNMUSIC_CHARTS_ENABLED='false'"
+    fi
     echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
     echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
@@ -624,6 +655,9 @@ ENV_DESIRED="$(mktemp)"
 # 用户本次明确提供了新值的键（音源开关/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
+# 歌单开关：仅当用户本次明确表态（--charts/--no-charts 或交互选择）时才覆盖，
+# 否则不出现在 desired 中，env_merge 会原样保留用户已有设置。
+[ -n "${ENABLE_CHARTS}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_CHARTS_ENABLED"
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     [ -n "${LLM_BASE_URL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL"
     [ -n "${LLM_API_KEY}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_API_KEY"
@@ -740,15 +774,34 @@ install_unit() {
     return 0
 }
 
+# 容器已存在且属于当前目录 → 已构建过，可跳过重建（up -d 会按需启动/重建容器本身）。
+# 自带归属校验：只有 compose project 工作目录等于 BASE_DIR 才认为可复用，
+# 避免跳过重建后误连到别的项目部署的同名容器。
+# 用户要更新到新镜像时用 --force-rebuild 强制重建。
+container_owned() {
+    local name="$1" owner
+    [ "${FORCE_REBUILD}" -eq 1 ] && return 1
+    run_docker container inspect "${name}" >/dev/null 2>&1 || return 1
+    owner="$(run_docker container inspect "${name}" \
+        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    [ "${owner}" = "${BASE_DIR}" ]
+}
+
 # --- musicdl ---
 install_musicdl_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
         return 1
     fi
-    log_info "构建并启动 musicdl 容器（基于 ${MUSICDL_REPO}）..."
     reclaim_container fnmusic-musicdl || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
+    # 容器已存在且属于当前目录：默认只确保"在运行"，不重新构建镜像
+    if container_owned fnmusic-musicdl; then
+        log_info "musicdl 容器已存在，跳过重建（如需强制重建请加 --force-rebuild）"
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d musicdl
+    else
+        log_info "构建并启动 musicdl 容器（基于 ${MUSICDL_REPO}）..."
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicdl
+    fi
     if wait_http "http://127.0.0.1:8768/healthz" 60 2; then
         log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
         return 0
@@ -756,7 +809,6 @@ install_musicdl_docker() {
     log_err "等待 musicdl healthz 超时"
     return 1
 }
-
 install_musicdl_host() {
     log_info "宿主机安装 musicdl 服务（pip 包来自 ${MUSICDL_REPO}）..."
     if [ ! -x "${BASE_DIR}/.venv-musicdl/bin/python" ]; then
@@ -806,9 +858,14 @@ install_musicbox_docker() {
         "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
         "${BASE_DIR}/musicbox-data/netease-musicbox"
     chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
-    log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
     reclaim_container fnmusic-musicbox || return 1
-    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
+    if container_owned fnmusic-musicbox; then
+        log_info "musicbox 容器已存在，跳过重建（如需强制重建请加 --force-rebuild）"
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d musicbox
+    else
+        log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
+    fi
     if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
         log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
         return 0
@@ -867,7 +924,6 @@ install_lxmusic_docker() {
         log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
         return 1
     fi
-    log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
     reclaim_container fnmusic-lxmusic || return 1
     # compose 一旦指定 --env-file 就不再读取默认的 .env。
     # 主 .env 存有 ensure_base_image.sh 探测出的 FNMUSIC_BASE_IMAGE
@@ -879,7 +935,13 @@ install_lxmusic_docker() {
     if [ "${ENABLE_LXSOURCE}" -eq 1 ] && [ -f "${BASE_DIR}/.env.lxsource.local" ]; then
         compose_args+=(--env-file "${BASE_DIR}/.env.lxsource.local")
     fi
-    run_docker compose "${compose_args[@]}" -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
+    if container_owned fnmusic-lxmusic; then
+        log_info "lxmusic 容器已存在，跳过重建（如需强制重建请加 --force-rebuild）"
+        run_docker compose "${compose_args[@]}" -f "${BASE_DIR}/docker-compose.yml" up -d lxmusic
+    else
+        log_info "构建并启动 lxmusic 容器（洛雪音乐源：酷狗 kg / 网易 wy / 咪咕 mg 免登录解析）..."
+        run_docker compose "${compose_args[@]}" -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
+    fi
     if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
         log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
         return 0
@@ -940,7 +1002,6 @@ install_lxsource_docker() {
         log_err "未找到 docker，无法使用 docker 模式"
         return 1
     fi
-    log_info "构建并启动 lxsource 订阅音源容器（:8774）..."
     reclaim_container fnmusic-lxsource || return 1
     # compose 指定 --env-file 后不再读取默认 .env：
     # 需同时带上主 .env（镜像源等部署配置）与订阅配置（订阅列表/令牌）。
@@ -948,8 +1009,15 @@ install_lxsource_docker() {
     if [ -f "${BASE_DIR}/.env.lxsource.local" ]; then
         compose_args+=(--env-file "${BASE_DIR}/.env.lxsource.local")
     fi
-    run_docker compose "${compose_args[@]}" \
-        -f "${BASE_DIR}/docker-compose.yml" up -d --build lxsource || return 1
+    if container_owned fnmusic-lxsource; then
+        log_info "lxsource 容器已存在，跳过重建（如需强制重建请加 --force-rebuild）"
+        run_docker compose "${compose_args[@]}" \
+            -f "${BASE_DIR}/docker-compose.yml" up -d lxsource || return 1
+    else
+        log_info "构建并启动 lxsource 订阅音源容器（:8774）..."
+        run_docker compose "${compose_args[@]}" \
+            -f "${BASE_DIR}/docker-compose.yml" up -d --build lxsource || return 1
+    fi
     if wait_http "http://127.0.0.1:8774/healthz" 60 2; then
         log_info "lxsource 已就绪 http://127.0.0.1:8774/healthz"
         return 0
